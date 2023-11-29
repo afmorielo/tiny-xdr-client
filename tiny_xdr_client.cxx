@@ -1,151 +1,228 @@
-#include <iostream>
+#include <arpa/inet.h>
 #include <chrono>
 #include <cstring>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <thread>
+#include <iostream>
 #include "mpmessages.hxx"
-#include "tiny_xdr.hxx"
 #include <sys/time.h>
-
-const char *FGMS_SERVER_IP = "127.0.0.1";        // Replace with your FGMS server IP
-const int FGMS_SERVER_PORT = 5000;               // Replace with your FGMS server port
+#include <thread>
+#include "tiny_xdr.hxx"
+#include <unistd.h>
 
 class XDRClient {
 public:
-    XDRClient() {
-        clientSocket = -1;
-        initializeSocket(clientSocket, FGMS_SERVER_PORT);
-    }
+    XDRClient(const char* serverIp, int serverPort) {
 
-    ~XDRClient() {
-        // Close the socket if it was opened
-        if (clientSocket != -1) {
-            close(clientSocket);
-        }
-    }
+        // Attemps to create a UDP socket
+        serverSocket = socket(AF_INET, SOCK_DGRAM, 0);
 
-    void initializeSocket(int& sock, int port) {
-
-        // Create a UDP socket
-        sock = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock == -1) {
-            std::cerr << "Error creating socket: " << strerror(errno) << " (" << errno << ")\n";
+        if (serverSocket == -1) {
+            std::cerr << "[ERROR] Failed to create socket at " << __FUNCTION__ << ": " << strerror(errno) << " (" << errno << ") " << "\n";
             std::exit(1);
         }
 
         // Set up the server address structure
         serverAddress.sin_family = AF_INET;
-        serverAddress.sin_port = htons(FGMS_SERVER_PORT);
-        if (inet_pton(AF_INET, FGMS_SERVER_IP, &serverAddress.sin_addr) <= 0) {
-            std::cerr << "Invalid address/ Address not supported\n";
-            close(sock);
+        serverAddress.sin_port = htons(serverPort);
+
+        if (inet_pton(AF_INET, serverIp, &serverAddress.sin_addr) <= 0) {
+            std::cerr << "[ERROR] Invalid address or address not supported at " << __FUNCTION__ << ": " << strerror(errno) << " (" << errno << ") " << "\n";
+            close(serverSocket);
             std::exit(1);
         }
 
     }
 
-    void sendData() {
+    ~XDRClient() {
 
-        while (true) {
-            std::cout << "Sending data...\n";
-            // Get the new position
-            double currentPosition[3] = {2589114.800074, -1080806.835734, 5708738.990279};
-            double currentOrientation[3] = {-2.130530, -1.660662, 0.242749};
-
-            // Prepare and send the message
-            T_PositionMsg positionMsg;
-            populatePositionMsg(positionMsg, currentPosition, currentOrientation);
-
-            T_MsgHdr msgHdr;
-            populateMsgHdr(msgHdr);
-
-            // Combine the header and message into a single buffer
-            char buffer[sizeof(msgHdr) + sizeof(positionMsg)];
-            std::memcpy(buffer, &msgHdr, sizeof(msgHdr));
-            std::memcpy(buffer + sizeof(msgHdr), &positionMsg, sizeof(positionMsg));
-
-            // Send the buffer to the server using sendto() for UDP
-            if (sendto(clientSocket, buffer, sizeof(buffer), 0, (struct sockaddr *)&serverAddress, sizeof(serverAddress)) == -1) {
-                std::cerr << "Error sending data: " << strerror(errno) << " (" << errno << ")\n";
-            }
-
-            // Add a delay if needed to control the sending rate
-            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 10 Hz delay
+        // Close the socket if it was opened
+        if (serverSocket != -1) {
+            close(serverSocket);
         }
+        
     }
 
-    void receiveData() {
+    void send(
+        const char* model,
+        const double currentPosition[3],
+        const float currentOrientation[3],
+        const float linearVel[3],
+        const float angularVel[3],
+        const float linearAccel[3],
+        const float angularAccel[3],
+        const char* callsign
+    ) {
+        std::cout << "Sending data...\n";
+
+        // Prepare and send the message
+        T_PositionMsg positionMsg;
+        populatePositionMsg(
+            positionMsg,
+            model,
+            currentPosition,
+            currentOrientation,
+            linearVel,
+            angularVel,
+            linearAccel,
+            angularAccel,
+            1.0,  // lag
+            0.0   // pad
+        );
+
+        T_MsgHdr msgHdr;
+        populateMsgHdr(
+            msgHdr,
+            MSG_MAGIC,
+            PROTO_VER,
+            POS_DATA_ID,
+            sizeof(T_MsgHdr) + sizeof(T_PositionMsg),
+            0,
+            100,
+            0,
+            callsign
+        );
+
+        // Combine the header and message into a single buffer
+        char buffer[sizeof(msgHdr) + sizeof(positionMsg)];
+        std::memcpy(buffer, &msgHdr, sizeof(msgHdr));
+        std::memcpy(buffer + sizeof(msgHdr), &positionMsg, sizeof(positionMsg));
+
+        // Send the buffer to the server using sendto() for UDP
+        if (sendto(serverSocket, buffer, sizeof(buffer), 0, (struct sockaddr *)&serverAddress, sizeof(serverAddress)) == -1) {
+            std::cerr << "[ERROR] Failed to send data at " << __FUNCTION__ << ": " << strerror(errno) << " (" << errno << ") " << "\n";
+        }
+
+    }
+
+    void receive() {
 
         while (true) {
+
             std::cout << "Receiving data...\n";
+
+            T_MsgHdr msgHdr;
+            T_PositionMsg positionMsg;
+
             char buffer[1024]; // Adjust the buffer size accordingly
             socklen_t receiveAddrLen = sizeof(serverAddress);
-            ssize_t bytesReceived = recvfrom(clientSocket, buffer, sizeof(buffer), 0, (struct sockaddr*)&serverAddress, &receiveAddrLen);
+            ssize_t bytesReceived = recvfrom(serverSocket, buffer, sizeof(buffer), 0, (struct sockaddr*)&serverAddress, &receiveAddrLen);
 
             if (bytesReceived == -1) {
-                std::cerr << "Error receiving data: " << strerror(errno) << " (" << errno << ")\n";
+                std::cerr << "[ERROR] Failed to receive data: " << strerror(errno) << " (" << errno << ")\n";
             } else if (bytesReceived == 0) {
-                std::cerr << "Connection closed by server\n";
+                std::cerr << "[ERROR] Connection closed by server!\n";
                 break;
             } else {
-                // Process the received data as needed
-                // TODO: Implement data processing logic
 
-                std::cout << "Received data: " << buffer << std::endl;
+                // Assuming sizeof(T_MsgHdr) is the size of the header in the buffer
+                std::memcpy(&msgHdr, buffer, sizeof(T_MsgHdr));
+                // Assuming sizeof(T_MsgHdr) is the size of the header in the buffer
+                std::memcpy(&positionMsg, buffer + sizeof(T_MsgHdr), sizeof(T_PositionMsg));
+
+                // Decode specific values from the received message
+                uint32_t magic = XDR_decode_uint32(msgHdr.Magic);
+                uint32_t version = XDR_decode_uint32(msgHdr.Version);
+                // ... Decode other fields as needed
+
+                std::cout << "Received data:\n";
+                std::cout << magic << ",";
+                std::cout << version << ",";
+                std::cout << msgHdr.Callsign << ",";
+                for (unsigned i = 0;  i < 3; ++i) {
+                    std::cout << XDR_decode_double(positionMsg.position[i]) << ",";
+                }
+                std::cout << "\n";
+                // ... Print other decoded values
+
+                // Now you have the decoded values in the msgHdr and positionMsg structures.
+                // You can use these values as needed for further processing.
             }
         }
     }
 
 private:
-    int clientSocket;
+    int serverSocket;
     struct sockaddr_in serverAddress;
+    const char* serverIp;
+    int serverPort;
 
-    void populatePositionMsg(T_PositionMsg &positionMsg, const double currentPosition[3], const double currentOrientation[3]) {
-        strncpy(positionMsg.Model, "Aircraft/f16/Models/F-16.xml", MAX_MODEL_NAME_LEN - 1);
+    void populatePositionMsg(
+        T_PositionMsg &positionMsg,
+        const char* model,
+        const double currentPosition[3],
+        const float currentOrientation[3],
+        const float linearVel[3],
+        const float angularVel[3],
+        const float linearAccel[3],
+        const float angularAccel[3],
+        double lag,
+        double pad
+    ) {
+        strncpy(positionMsg.Model, model, MAX_MODEL_NAME_LEN - 1);
         positionMsg.Model[MAX_MODEL_NAME_LEN - 1] = '\0';
-        positionMsg.time = XDR_encode_double(static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        positionMsg.time = XDR_encode_double(static_cast<double>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::system_clock::now().time_since_epoch())
                 .count()));
-        positionMsg.lag = XDR_encode_double(1.0);
+        positionMsg.lag = XDR_encode_double(lag);
 
-        for (unsigned i = 0;  i < 3; ++i) {
+        for (unsigned i = 0; i < 3; ++i) {
             positionMsg.position[i] = XDR_encode_double(currentPosition[i]);
             positionMsg.orientation[i] = XDR_encode_float(currentOrientation[i]);
-            positionMsg.linearVel[i] = XDR_encode_float(0.0);
-            positionMsg.angularVel[i] = XDR_encode_float(0.0);
-            positionMsg.linearAccel[i] = XDR_encode_float(0.0);
-            positionMsg.angularAccel[i] = XDR_encode_float(0.0);
+            positionMsg.linearVel[i] = XDR_encode_float(linearVel[i]);
+            positionMsg.angularVel[i] = XDR_encode_float(angularVel[i]);
+            positionMsg.linearAccel[i] = XDR_encode_float(linearAccel[i]);
+            positionMsg.angularAccel[i] = XDR_encode_float(angularAccel[i]);
         }
 
-        positionMsg.pad = 0;
+        positionMsg.pad = XDR_encode_double(pad);
     }
 
-    void populateMsgHdr(T_MsgHdr &msgHdr) {
+    void populateMsgHdr(
+        T_MsgHdr &msgHdr,
+        uint32_t magic,
+        uint32_t version,
+        uint32_t msgId,
+        uint32_t msgLen,
+        uint32_t requestedRangeNmMin,
+        uint32_t requestedRangeNmMax,
+        uint16_t replyPort,
+        const char* callsign
+    ) {
         // Populate msgHdr fields as needed
-        // Writing the Header (some fixed values)
-        msgHdr.Magic = XDR_encode_uint32(MSG_MAGIC);
-        msgHdr.Version = XDR_encode_uint32(PROTO_VER);
-        msgHdr.MsgId = XDR_encode_uint32(POS_DATA_ID);
-        msgHdr.MsgLen = XDR_encode_uint32((uint32_t) (sizeof(msgHdr) + sizeof(T_PositionMsg)));
-        msgHdr.RequestedRangeNm = XDR_encode_shortints32(0, 100);
-        msgHdr.ReplyPort = 0;
-        strncpy(msgHdr.Callsign, "AFMC", MAX_CALLSIGN_LEN);
+        // Writing the Header (some fixed or default values)
+        msgHdr.Magic = XDR_encode_uint32(magic);
+        msgHdr.Version = XDR_encode_uint32(version);
+        msgHdr.MsgId = XDR_encode_uint32(msgId);
+        msgHdr.MsgLen = XDR_encode_uint32(msgLen);
+        msgHdr.RequestedRangeNm = XDR_encode_shortints32(requestedRangeNmMin, requestedRangeNmMax);
+        msgHdr.ReplyPort = XDR_encode_uint16(replyPort);
+        strncpy(msgHdr.Callsign, callsign, MAX_CALLSIGN_LEN);
         msgHdr.Callsign[MAX_CALLSIGN_LEN - 1] = '\0';
     }
 };
 
 int main() {
-    XDRClient client;
+    XDRClient client("127.0.0.1", 5000);
 
-    // Create a thread for the sendData() method
-    std::thread sendThread(&XDRClient::sendData, &client);
+    // Create a thread for the receive() method
+    std::thread receiveThread(&XDRClient::receive, &client);
 
-    // Create a thread for the receiveData() method
-    std::thread receiveThread(&XDRClient::receiveData, &client);
+    // Main loop for sending data
+    while (true) {
+        client.send("Aircraft/f16/Models/F-16.xml",
+                    std::array<double, 3>{2589114.800074, -1080806.835734, 5708738.990279}.data(),
+                    std::array<float, 3>{-2.130530, -1.660662, 0.242749}.data(),
+                    std::array<float, 3>{0.0, 0.0, 0.0}.data(),
+                    std::array<float, 3>{0.0, 0.0, 0.0}.data(),
+                    std::array<float, 3>{0.0, 0.0, 0.0}.data(),
+                    std::array<float, 3>{0.0, 0.0, 0.0}.data(),
+                    "AFMC");
 
-    // Wait for both threads to finish
-    sendThread.join();
+        // Add a delay if needed to control the sending rate
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 10 Hz delay
+    }
+
+    // This line will never be reached, but it's here for completeness
     receiveThread.join();
 
     return 0;
